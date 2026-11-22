@@ -1,0 +1,14 @@
+site-generator-speed-01-run-20261122 entry: a faster drop-in for makefun-site 1.0.0.
+
+  solve.js  my own implementation of the makefun-site spec, written from the
+            kit's README.md and the reference program's observable behaviour
+            (front matter, template dialect, Markdown subset, slug rule,
+            build report). No vendored code is shipped: the house baseline's
+            vendor/makefun-site/ tree is not in this repository, and solve.js
+            imports nothing from it. Output verified byte-identical against
+            the reference on the practice set and on extra cases drawn from
+            the kit's own generator.
+  main.ts   the driver: reads /input/cases.json, answers each case with run(),
+            writes /output/answers.json.
+
+  licence   MIT (LICENSE)
