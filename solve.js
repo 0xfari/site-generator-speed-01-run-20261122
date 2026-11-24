@@ -33,11 +33,6 @@ function escapeHtml(text) {
   return ESCAPE_TEST.test(text) ? text.replace(ESCAPE_ALL, (c) => ESCAPES[c]) : text;
 }
 
-/** Push `run` onto `out`, escaped, without a replace when it is clean. */
-function pushEscaped(out, run) {
-  out.push(ESCAPE_TEST.test(run) ? run.replace(ESCAPE_ALL, (c) => ESCAPES[c]) : run);
-}
-
 /** The most characters a slug keeps before a collision suffix. */
 const SLUG_MAX = 64;
 
@@ -59,8 +54,40 @@ const slugCache = new Map();
 function slugify(text) {
   const hit = slugCache.get(text);
   if (hit !== undefined) return hit;
+  // Fast path: plain ASCII letters, digits, spaces and dashes need no NFKD
+  // normalisation and no regexes — one char scan builds the slug, a
+  // separator run collapsing to one dash, none at either end. Anything else
+  // (non-ASCII, other punctuation) falls through to the slow path, so the
+  // result is identical to the reference's per-character loop.
+  let out = '';
+  let pending = false;
+  let ascii = true;
+  for (let i = 0; i < text.length; i++) {
+    if (out.length >= SLUG_MAX) break;
+    const c = text.charCodeAt(i);
+    if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
+      if (pending && out !== '') out += '-';
+      pending = false;
+      out += text[i];
+    } else if (c >= 65 && c <= 90) {
+      if (pending && out !== '') out += '-';
+      pending = false;
+      out += String.fromCharCode(c + 32);
+    } else if (c === 32 || c === 45) {
+      pending = true;
+    } else {
+      ascii = false;
+      break;
+    }
+  }
+  if (ascii) {
+    out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
+    if (out === '') out = 'untitled';
+    slugCache.set(text, out);
+    return out;
+  }
   const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
-  let out = plain.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+/, '').replace(/-+$/, '');
+  out = plain.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+/, '').replace(/-+$/, '');
   out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
   if (out === '') out = 'untitled';
   slugCache.set(text, out);
@@ -99,6 +126,29 @@ function wordsOf(text) {
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
     const c = text.charCodeAt(i);
+    const ws = c < 128 ? WS128[c] === 1 : isWSUni(c);
+    if (ws) {
+      inWord = false;
+    } else if (!inWord) {
+      inWord = true;
+      count++;
+    }
+  }
+  return count;
+}
+
+/**
+ * The words of one line, on its own: a word never spans a newline (a
+ * newline is whitespace), so per-line counts sum to wordsOf over the whole
+ * body. renderMarkdown calls this for every line it visits, which fuses the
+ * reading-minutes word count into the pass that already walks the body
+ * instead of scanning the body a second time in cardOf.
+ */
+function wordsInLine(line) {
+  let count = 0;
+  let inWord = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line.charCodeAt(i);
     const ws = c < 128 ? WS128[c] === 1 : isWSUni(c);
     if (ws) {
       inWord = false;
@@ -194,7 +244,8 @@ function parseFrontMatter(text) {
   const firstEnd = nl === -1 ? n : nl;
   if (text.slice(0, firstEnd) !== '---') return { error: 'no front matter' };
   // Scan the lines after the opening "---" for the closing one, keeping each
-  // line's bounds so the parse pass below re-slices nothing twice.
+  // line's bounds (flat [start, end, start, end, ...]) so the parse pass
+  // below re-slices nothing twice and allocates no pair per line.
   let pos = firstEnd === n ? n : firstEnd + 1;
   let lineNo = 1; // 0-based index of the line starting at pos
   let closeLine = -1;
@@ -203,7 +254,7 @@ function parseFrontMatter(text) {
   while (pos <= n) {
     nl = text.indexOf('\n', pos);
     const end = nl === -1 ? n : nl;
-    bounds.push([pos, end]);
+    bounds.push(pos, end);
     if (end - pos === 3 && text.charCodeAt(pos) === 45 && text.charCodeAt(pos + 1) === 45 && text.charCodeAt(pos + 2) === 45) {
       closeLine = lineNo;
       closeNl = nl;
@@ -217,7 +268,8 @@ function parseFrontMatter(text) {
   const data = {};
   // Parse lines 1..closeLine-1, each from the bounds found above.
   for (let i = 1; i < closeLine; i++) {
-    const [ls, le] = bounds[i - 1];
+    const ls = bounds[2 * (i - 1)];
+    const le = bounds[2 * (i - 1) + 1];
     const line = text.slice(ls, le);
     let blank = true;
     for (let k = 0; k < line.length; k++) {
@@ -343,32 +395,60 @@ function findSingleStar(s, from) {
 }
 
 /**
- * `s` rendered inline; `env.link(target)` is a link's href. One pass: plain
- * runs are batched and escaped in bulk, so the common case (a run of words)
- * costs one slice and one regex test instead of one escape call per char.
+ * `s` rendered inline; `env.link(target)` is a link's href. One pass over
+ * one regex that matches specials AND characters HTML escaping touches:
+ * the run before a match is clean by construction, so it is pushed raw
+ * with no escape test per run — the old version scanned for specials and
+ * then tested every run for escapes separately.
  */
-const SPECIAL_TEST = /[\\`*[]/;
+const SPECIAL_G = /[\\`*\[&<>"']/g;
 
-/** `s` rendered inline; `env.link(target)` is a link's href. One pass: plain
- * runs are batched and escaped in bulk, so the common case (a run of words)
- * costs one slice and one regex test instead of one escape call per char. */
-const SPECIAL_G = /[\\`*[]/g;
+/** Either a special (\\ ` * [) or a character HTML escaping touches. */
+const INLINE_TEST = /[\\`*\[&<>"']/;
 
 function inline(s, env) {
-  if (!SPECIAL_TEST.test(s)) return escapeHtml(s);
+  // One test covers the common case: no specials and nothing to escape
+  // means the string comes back untouched.
+  if (!INLINE_TEST.test(s)) return s;
   const out = [];
   let i = 0;
   const n = s.length;
   while (i < n) {
-    // The next special character, found natively; lastIndex is set before
-    // every exec, so a recursive inline() below cannot corrupt the scan.
+    // The next character that needs handling, found natively; lastIndex is
+    // set before every exec, so a recursive inline() below cannot corrupt
+    // the scan.
     SPECIAL_G.lastIndex = i;
     const spec = SPECIAL_G.exec(s);
     const j = spec === null ? n : spec.index;
-    if (j > i) pushEscaped(out, s.slice(i, j));
+    if (j > i) out.push(s.slice(i, j));
     if (j >= n) break;
     i = j;
     const c = s[i];
+    if (c === '&') {
+      out.push('&amp;');
+      i++;
+      continue;
+    }
+    if (c === '<') {
+      out.push('&lt;');
+      i++;
+      continue;
+    }
+    if (c === '>') {
+      out.push('&gt;');
+      i++;
+      continue;
+    }
+    if (c === '"') {
+      out.push('&quot;');
+      i++;
+      continue;
+    }
+    if (c === "'") {
+      out.push('&#39;');
+      i++;
+      continue;
+    }
     if (c === '\\') {
       const nx = s[i + 1];
       if (nx !== undefined && ESCAPABLE.has(nx)) {
@@ -440,6 +520,7 @@ function renderMarkdown(src, env) {
   let html = '';
   const toc = [];
   let excerpt = null;
+  let words = 0;
   // One native split: every line is found here, in C++, instead of one
   // indexOf plus one slice plus one pair allocation per line in JS.
   const lines = src.split('\n');
@@ -447,6 +528,7 @@ function renderMarkdown(src, env) {
   let li = 0;
   while (li < L) {
     const line = lines[li];
+    words += wordsInLine(line);
     if (isBlank(line)) {
       li++;
       continue;
@@ -457,6 +539,7 @@ function renderMarkdown(src, env) {
       li++;
       while (li < L) {
         const l2 = lines[li];
+        words += wordsInLine(l2);
         if (l2.startsWith('```') && FENCE_CLOSE.test(l2)) {
           li++;
           break;
@@ -489,6 +572,7 @@ function renderMarkdown(src, env) {
       while (li < L) {
         const l2 = lines[li];
         if (l2[0] !== '>') break;
+        words += wordsInLine(l2);
         q.push(l2[1] === ' ' ? l2.slice(2) : l2.slice(1));
         li++;
       }
@@ -511,9 +595,11 @@ function renderMarkdown(src, env) {
           ? (d0 >= 48 && d0 <= 57 ? ORDERED_RE.exec(l2) : null)
           : ((d0 === 45 || d0 === 42) && l2.charCodeAt(1) === 32 ? BULLET_RE.exec(l2) : null);
         if (m !== null) {
+          words += wordsInLine(l2);
           items.push([trimLine(isOrdered ? m[2] : m[1])]);
           li++;
         } else if (isContinued(l2)) {
+          words += wordsInLine(l2);
           items[items.length - 1].push(trimLine(l2));
           li++;
         } else break;
@@ -530,6 +616,7 @@ function renderMarkdown(src, env) {
     while (li < L) {
       const l2 = lines[li];
       if (endsParagraph(l2)) break;
+      words += wordsInLine(l2);
       body.push(trimLine(l2));
       li++;
     }
@@ -537,7 +624,7 @@ function renderMarkdown(src, env) {
     if (excerpt === null) excerpt = h;
     html += `<p>${h}</p>\n`;
   }
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { html, toc, excerpt: excerpt ?? '', words };
 }
 
 // ----------------------------------------------------------------- Templates
@@ -550,8 +637,61 @@ const FOR_RE = /^for ([A-Za-z_][A-Za-z0-9_]*) in (\S+)$/;
 const IF_RE = /^if (not )?(\S+)$/;
 const INCLUDE_RE = /^include "([a-z0-9-]+)"$/;
 
-/** A template that does not parse: its name and why. */
-class TemplateError extends Error {}
+/** The free variable roots of `nodes`: first path segments no enclosing for binds. Includes contribute nothing here — the fixpoint below adds them. */
+function freeRoots(nodes, bound, out) {
+  for (const n of nodes) {
+    if (n.kind === 'var' || n.kind === 'raw' || n.kind === 'if') {
+      if (!bound.has(n.path[0])) out.add(n.path[0]);
+    } else if (n.kind === 'for') {
+      if (!bound.has(n.path[0])) out.add(n.path[0]);
+      const inner = new Set(bound);
+      inner.add(n.name);
+      inner.add('loop');
+      freeRoots(n.body, inner, out);
+    }
+    if (n.kind === 'if') {
+      freeRoots(n.then, bound, out);
+      if (n.else !== null) freeRoots(n.else, bound, out);
+    }
+  }
+  return out;
+}
+
+/** Every template's free roots, includes resolved transitively (fixpoint: includes may recurse). */
+function templateFreeVars(templates) {
+  const free = new Map();
+  for (const [name, nodes] of templates) free.set(name, freeRoots(nodes, new Set(), new Set()));
+  const includesOf = new Map();
+  for (const [name, nodes] of templates) {
+    const incs = new Set();
+    const walk = (ns) => {
+      for (const n of ns) {
+        if (n.kind === 'include') incs.add(n.name);
+        else if (n.kind === 'for') walk(n.body);
+        else if (n.kind === 'if') {
+          walk(n.then);
+          if (n.else !== null) walk(n.else);
+        }
+      }
+    };
+    walk(nodes);
+    includesOf.set(name, incs);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [name, incs] of includesOf) {
+      const f = free.get(name);
+      const before = f.size;
+      for (const inc of incs) {
+        const g = free.get(inc);
+        if (g !== undefined) for (const r of g) f.add(r);
+      }
+      if (f.size !== before) changed = true;
+    }
+  }
+  return free;
+}
 
 /** The path `text` names, split at its dots, or a TemplateError. */
 function pathOf(name, text) {
@@ -643,12 +783,18 @@ function parseTemplate(name, src) {
   return root.body;
 }
 
-/** The value at `path` in the scope chain: its first name from the nearest scope holding it, then own properties. */
-function lookup(scope, path) {
-  let s = scope;
-  while (s !== null && !Object.hasOwn(s.vars, path[0])) s = s.parent;
-  if (s === null) return undefined;
-  let v = s.vars[path[0]];
+/**
+ * The value at `path` in `vars`. Scope chains are prototype chains: a
+ * `for` child's vars are `Object.create` of its parent's, and the root vars
+ * are a null-prototype object, so the nearest definition wins exactly as the
+ * old scope walk did, with one property lookup instead of a walk plus a
+ * hasOwn per scope. The chain never reaches Object.prototype (the root is
+ * null-prototype), so a name no scope defines reads undefined, and
+ * `__proto__` behaves like an ordinary key.
+ */
+function lookup(vars, path) {
+  let v = vars[path[0]];
+  if (v === undefined) return undefined;
   for (let k = 1; k < path.length; k++) {
     if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
     v = v[path[k]];
@@ -672,12 +818,21 @@ function truthy(v) {
 }
 
 /**
- * `nodes` rendered in `scope` ({ vars, parent }). `ctx` holds the parsed
- * templates, the HTML escape and the include depth. A `for` reuses one child
- * scope object across its elements — rendering is synchronous, so no iteration
- * can observe another's bindings — instead of allocating a scope per element.
+ * `nodes` rendered in `vars` (a prototype-chained scope: see lookup).
+ * `ctx` holds the parsed templates, the HTML escape, the include depth and
+ * the per-case include caches. A `for` reuses one child vars object across
+ * its elements — rendering is synchronous, so no iteration can observe
+ * another's bindings — instead of allocating a scope per element.
+ *
+ * Includes are memoised when their result is a pure function of few values:
+ * free of every non-case-level root (or only case-level roots site/tags/
+ * recent, rendered outside any for) the render is cached per case, keyed by
+ * template and depth — header/footer/nav render once per case instead of
+ * once per page — and a template with exactly one free root is cached by
+ * that root's value (a post's card renders once however many lists show
+ * it). A template's free roots are computed once per case in build().
  */
-function renderNodes(nodes, scope, ctx, depth) {
+function renderNodes(nodes, vars, ctx, depth, forDepth) {
   let out = '';
   for (const n of nodes) {
     switch (n.kind) {
@@ -685,35 +840,63 @@ function renderNodes(nodes, scope, ctx, depth) {
         out += n.text;
         break;
       case 'var':
-        out += ctx.escape(textOf(lookup(scope, n.path)));
+        out += ctx.escape(textOf(lookup(vars, n.path)));
         break;
       case 'raw':
-        out += textOf(lookup(scope, n.path));
+        out += textOf(lookup(vars, n.path));
         break;
       case 'if': {
-        const v = truthy(lookup(scope, n.path));
+        const v = truthy(lookup(vars, n.path));
         const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) out += renderNodes(branch, scope, ctx, depth);
+        if (branch !== null) out += renderNodes(branch, vars, ctx, depth, forDepth);
         break;
       }
       case 'for': {
-        const xs = lookup(scope, n.path);
+        const xs = lookup(vars, n.path);
         if (!Array.isArray(xs)) break;
-        const child = { vars: {}, parent: scope };
+        const child = Object.create(vars);
         const loop = { index: 0, first: false, last: false, length: xs.length };
-        child.vars.loop = loop;
+        child.loop = loop;
         for (let k = 0; k < xs.length; k++) {
           loop.index = k + 1;
           loop.first = k === 0;
           loop.last = k === xs.length - 1;
-          child.vars[n.name] = xs[k];
-          out += renderNodes(n.body, child, ctx, depth);
+          child[n.name] = xs[k];
+          out += renderNodes(n.body, child, ctx, depth, forDepth + 1);
         }
         break;
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) out += renderNodes(t, scope, ctx, depth + 1);
+        if (t === undefined || depth >= INCLUDE_DEPTH) break;
+        const free = ctx.freeVars.get(n.name);
+        if (free !== undefined && (free.size === 0 || (forDepth === 0 && [...free].every((r) => r === 'site' || r === 'tags' || r === 'recent')))) {
+          // Case-level only (or nothing at all): same result every render.
+          const key = `${n.name}@${depth}`;
+          let hit = ctx.cache.get(key);
+          if (hit === undefined) {
+            hit = renderNodes(t, vars, ctx, depth + 1, forDepth);
+            ctx.cache.set(key, hit);
+          }
+          out += hit;
+        } else if (free !== undefined && free.size === 1) {
+          // Exactly one free root: cache by that root's value.
+          const root = [...free][0];
+          const v = lookup(vars, [root]);
+          let byVal = ctx.cacheByValue.get(`${n.name}@${depth}`);
+          if (byVal === undefined) {
+            byVal = new Map();
+            ctx.cacheByValue.set(`${n.name}@${depth}`, byVal);
+          }
+          let hit = byVal.get(v);
+          if (hit === undefined) {
+            hit = renderNodes(t, vars, ctx, depth + 1, forDepth);
+            byVal.set(v, hit);
+          }
+          out += hit;
+        } else {
+          out += renderNodes(t, vars, ctx, depth + 1, forDepth);
+        }
         break;
       }
     }
@@ -831,6 +1014,7 @@ function markdown(b) {
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
+    s.wordCount = md.words;
   }
 }
 
@@ -883,7 +1067,7 @@ function cardOf(s) {
     date_long: s.data.date === undefined ? '' : longDate(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
+    reading_minutes: Math.max(1, Math.ceil((s.wordCount ?? wordsOf(s.body)) / 200)),
     tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
   };
 }
@@ -907,10 +1091,18 @@ function layouts(b) {
   const site = { title: b.input.site.title, base_url: b.base };
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
-  const ctx = { templates: b.templates, escape: escapeHtml };
+  const ctx = { templates: b.templates, freeVars: b.freeVars, escape: escapeHtml, cache: new Map(), cacheByValue: new Map() };
   const render = (name, vars) => {
     const nodes = b.templates.get(name);
-    return nodes === undefined ? null : renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0);
+    if (nodes === undefined) return null;
+    // Null-prototype root vars: the lookup chain ends at null, never at
+    // Object.prototype, so an undefined name reads undefined.
+    const rootVars = Object.create(null);
+    rootVars.site = site;
+    rootVars.tags = allTags;
+    rootVars.recent = recent;
+    Object.assign(rootVars, vars);
+    return renderNodes(nodes, rootVars, ctx, 0, 0);
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s, b.cards.get(s)) });
   const per = b.input.site.per_page;
@@ -962,6 +1154,7 @@ export function build(input) {
     input,
     base: input.site.base_url.replace(/\/+$/, ''),
     templates,
+    freeVars: templateFreeVars(templates),
     sources: [],
     statics: [],
     bySource: new Map(),
